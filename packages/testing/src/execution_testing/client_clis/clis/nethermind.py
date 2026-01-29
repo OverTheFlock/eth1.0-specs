@@ -320,10 +320,10 @@ class NethermindExceptionMapper(ExceptionMapper):
             "max initcode size exceeded"
         ),
         TransactionException.NONCE_MISMATCH_TOO_LOW: (
-            "wrong transaction nonce"
+            "transaction nonce is too low"
         ),
         TransactionException.NONCE_MISMATCH_TOO_HIGH: (
-            "wrong transaction nonce"
+            "transaction nonce is too high"
         ),
         TransactionException.INSUFFICIENT_MAX_FEE_PER_BLOB_GAS: (
             "InsufficientMaxFeePerBlobGas: Not enough to cover blob gas fee"
@@ -338,7 +338,7 @@ class NethermindExceptionMapper(ExceptionMapper):
             "InvalidTxType: Transaction type in Custom is not supported"
         ),
         TransactionException.TYPE_3_TX_ZERO_BLOBS: (
-            "blob transaction missing blob hashes"
+            "blob transaction must have at least 1 blob"
         ),
         TransactionException.TYPE_3_TX_INVALID_BLOB_VERSIONED_HASH: (
             "InvalidBlobVersionedHashVersion: Blob version not supported"
