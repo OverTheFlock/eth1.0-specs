@@ -1,16 +1,21 @@
 """Simple CLI tool to hash a directory of JSON fixtures."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import sys
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, TypeVar
 
 import click
 from rich.console import Console
 from rich.markup import escape as rich_escape
+
+if TYPE_CHECKING:
+    from execution_testing.fixtures.consume import TestCaseIndexFile
 
 
 class HashableItemType(IntEnum):
@@ -144,6 +149,104 @@ class HashableItem:
                 )
                 items[file_path.name] = item
         return cls(type=HashableItemType.FOLDER, items=items, parents=parents)
+
+    @classmethod
+    def from_index_entries(
+        cls, entries: List["TestCaseIndexFile"]
+    ) -> "HashableItem":
+        """
+        Create a hashable item tree from index entries (no file I/O).
+
+        This produces the same hash as from_folder() but uses pre-collected
+        fixture hashes instead of reading files from disk.
+
+        Optimized to O(n) using a trie-like structure built in a single pass,
+        avoiding repeated path operations and iterations.
+        """
+        raw = [
+            {
+                "id": e.id,
+                "json_path": str(e.json_path),
+                "fixture_hash": str(e.fixture_hash)
+                if e.fixture_hash
+                else None,
+            }
+            for e in entries
+        ]
+        return cls.from_raw_entries(raw)
+
+    @classmethod
+    def from_raw_entries(cls, entries: List[Dict]) -> "HashableItem":
+        """
+        Create a hashable item tree from raw entry dicts (no file I/O).
+
+        Accepts dicts with "id", "json_path", and "fixture_hash" keys.
+        This avoids Pydantic overhead entirely — only plain string/int
+        operations are used to build the hash tree.
+
+        Produces the same hash as from_folder() and from_index_entries().
+        """
+        # Build a trie where each node is either:
+        # - A dict (folder node) containing child nodes
+        # - A list of (test_id, hash_bytes) tuples (file node marker)
+        #
+        # Structure: {folder: {folder: {file.json: [(id, hash), ...]}}}
+        root_trie: dict = {}
+
+        # Single pass: insert all entries into trie
+        for entry in entries:
+            fixture_hash = entry.get("fixture_hash")
+            if not fixture_hash:
+                continue
+
+            # Navigate/create path to file node
+            path_parts = Path(entry["json_path"]).parts
+            current = root_trie
+
+            # Navigate to parent folder, creating nodes as needed
+            for part in path_parts[:-1]:
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+
+            # Add test entry to file node
+            file_name = path_parts[-1]
+            if file_name not in current:
+                current[file_name] = []
+
+            # Convert hex string to 32-byte hash
+            hash_bytes = int(fixture_hash, 16).to_bytes(32, "big")
+            current[file_name].append((entry["id"], hash_bytes))
+
+        # Convert trie to HashableItem tree (single recursive pass)
+        def trie_to_hashable(node: dict) -> Dict[str, "HashableItem"]:
+            """Convert a trie node to HashableItem dict."""
+            items: Dict[str, HashableItem] = {}
+
+            for name, child in node.items():
+                if isinstance(child, list):
+                    # File node: child is list of (test_id, hash_bytes)
+                    test_items = {
+                        test_id: cls(
+                            type=HashableItemType.TEST, root=hash_bytes
+                        )
+                        for test_id, hash_bytes in child
+                    }
+                    items[name] = cls(
+                        type=HashableItemType.FILE, items=test_items
+                    )
+                else:
+                    # Folder node: recurse
+                    items[name] = cls(
+                        type=HashableItemType.FOLDER,
+                        items=trie_to_hashable(child),
+                    )
+
+            return items
+
+        return cls(
+            type=HashableItemType.FOLDER, items=trie_to_hashable(root_trie)
+        )
 
 
 def render_hash_report(

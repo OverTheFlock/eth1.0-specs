@@ -29,7 +29,7 @@ from execution_testing.base_types import (
     ReferenceSpec,
 )
 from execution_testing.cli.gen_index import (
-    generate_fixtures_index,
+    merge_partial_indexes,
 )
 from execution_testing.client_clis import TransitionTool
 from execution_testing.client_clis.clis.geth import FixtureConsumerTool
@@ -44,6 +44,7 @@ from execution_testing.fixtures import (
     PreAllocGroupBuilders,
     PreAllocGroups,
     TestInfo,
+    merge_partial_fixture_files,
 )
 from execution_testing.forks import (
     Fork,
@@ -1237,11 +1238,16 @@ def fixture_collector(
         single_fixture_per_file=fixture_output.single_fixture_per_file,
         filler_path=filler_path,
         base_dump_dir=base_dump_dir,
+        generate_index=request.config.getoption("generate_index"),
     )
     yield fixture_collector
-    fixture_collector.dump_fixtures()
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER", None)
+    fixture_collector.dump_fixtures(worker_id)
     if do_fixture_verification:
         fixture_collector.verify_fixture_files(evm_fixture_verification)
+    # Write partial index for this worker/scope
+    if fixture_collector.generate_index:
+        fixture_collector.write_partial_index(worker_id)
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -1589,6 +1595,19 @@ def pytest_collection_modifyitems(
     for i in reversed(items_for_removal):
         items.pop(i)
 
+    # Schedule slow-marked tests first (Longest Processing Time First).
+    # Workers each grab the next test from the queue, so slow tests get
+    # distributed across workers and finish before the fast-test tail.
+    slow_items = []
+    normal_items = []
+    for item in items:
+        if item.get_closest_marker("slow") is not None:
+            slow_items.append(item)
+        else:
+            normal_items.append(item)
+    if slow_items:
+        items[:] = slow_items + normal_items
+
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """
@@ -1630,18 +1649,24 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     if fixture_output.is_stdout or is_help_or_collectonly_mode(session.config):
         return
 
+    # Merge partial fixture files from all workers into final JSON files
+    merge_partial_fixture_files(fixture_output.directory)
+
     # Remove any lock files that may have been created.
     for file in fixture_output.directory.rglob("*.lock"):
         file.unlink()
 
-    # Generate index file for all produced fixtures.
+    # Generate index file for all produced fixtures by merging partial indexes.
+    # Only merge if partial indexes were actually written (i.e., tests produced
+    # fixtures). When no tests are filled (e.g., all skipped), no partial
+    # indexes exist and merge_partial_indexes should not be called.
     if (
         session.config.getoption("generate_index")
         and not session_instance.phase_manager.is_pre_alloc_generation
     ):
-        generate_fixtures_index(
-            fixture_output.directory, quiet_mode=True, force_flag=False
-        )
+        meta_dir = fixture_output.directory / ".meta"
+        if meta_dir.exists() and any(meta_dir.glob("partial_index*.jsonl")):
+            merge_partial_indexes(fixture_output.directory, quiet_mode=True)
 
     # Create tarball of the output directory if the output is a tarball.
     fixture_output.create_tarball()

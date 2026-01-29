@@ -226,5 +226,79 @@ def generate_fixtures_index(
         f.write(index.model_dump_json(exclude_none=False, indent=2))
 
 
+def merge_partial_indexes(output_dir: Path, quiet_mode: bool = False) -> None:
+    """
+    Merge partial index files from all workers into final index.json.
+
+    This is called by pytest_sessionfinish on the master process after all
+    workers have finished and written their partial indexes.
+
+    Partial indexes use JSONL format (one JSON object per line) for efficient
+    append-only writes during fill. Entries are validated with Pydantic here.
+
+    Args:
+        output_dir: The fixture output directory.
+        quiet_mode: If True, don't print status messages.
+
+    """
+    meta_dir = output_dir / ".meta"
+    partial_files = list(meta_dir.glob("partial_index*.jsonl"))
+
+    if not partial_files:
+        raise Exception("No partial indexes found.")
+
+    # Merge all partial indexes (JSONL format: one entry per line)
+    # Read as raw dicts — the data was already validated when collected
+    # from live Pydantic fixture objects in add_fixture().
+    all_raw_entries: list[dict] = []
+    all_forks: set = set()
+    all_formats: set = set()
+
+    for partial_file in partial_files:
+        with open(partial_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry_data = json.loads(line)
+                all_raw_entries.append(entry_data)
+                # Collect forks and formats from raw strings
+                if entry_data.get("fork"):
+                    all_forks.add(entry_data["fork"])
+                if entry_data.get("format"):
+                    all_formats.add(entry_data["format"])
+
+    # Compute root hash from raw dicts (no Pydantic needed)
+    root_hash = HashableItem.from_raw_entries(all_raw_entries).hash()
+
+    # Build final index — Pydantic validates the entire structure once
+    # via model_validate(), not 96k individual model_validate() calls.
+    index = IndexFile.model_validate(
+        {
+            "test_cases": all_raw_entries,
+            "root_hash": HexNumber(root_hash),
+            "created_at": datetime.datetime.now(),
+            "test_count": len(all_raw_entries),
+            "forks": list(all_forks),
+            "fixture_formats": list(all_formats),
+        }
+    )
+
+    # Write final index
+    index_path = meta_dir / "index.json"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    index_path.write_text(index.model_dump_json(exclude_none=True, indent=2))
+
+    if not quiet_mode:
+        rich.print(
+            f"[green]Merged {len(partial_files)} partial indexes "
+            f"({len(all_raw_entries)} test cases) into {index_path}[/]"
+        )
+
+    # Cleanup partial files
+    for partial_file in partial_files:
+        partial_file.unlink()
+
+
 if __name__ == "__main__":
     generate_fixtures_index_cli()
