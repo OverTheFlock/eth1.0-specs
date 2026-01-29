@@ -152,10 +152,10 @@ def test_fill_state_test(
         number=1,
         timestamp=1000,
     )
-
+    contract_code = Op.SSTORE(1, Op.CHAINID) + Op.LOG1(0, 1, 2) + Op.STOP
     pre = {
         0x1000000000000000000000000000000000000000: Account(
-            code="0x4660015500"
+            code=contract_code
         ),
         "0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b": Account(
             balance=1000000000000000000000
@@ -189,7 +189,7 @@ def test_fill_state_test(
 
     post = {
         "0x1000000000000000000000000000000000000000": Account(
-            code="0x4660015500", storage={"0x01": "0x01"}
+            code=contract_code, storage={"0x01": "0x01"}
         ),
     }
 
@@ -545,6 +545,12 @@ class TestFillBlockchainValidTxs:
             BlockchainEngineFixtureCommon,
         )
 
+        with open("/tmp/actual.json", "w") as f:
+            f.write(
+                json.dumps(
+                    blockchain_test_fixture.json_dict_with_info(), indent=4
+                )
+            )
         assert isinstance(
             blockchain_test_fixture,
             (BlockchainFixtureCommon, BlockchainEngineFixtureCommon),
@@ -566,6 +572,7 @@ class TestFillBlockchainValidTxs:
         remove_info_metadata(fixture)
         assert fixture_name in fixture
         assert fixture_name in expected
+
         assert fixture[fixture_name] == expected[fixture_name]
 
     @pytest.mark.parametrize("fork", [London], indirect=True)
@@ -946,4 +953,12 @@ def test_fill_blockchain_invalid_txs(
     remove_info_metadata(fixture)
     assert fixture_name in fixture
     assert fixture_name in expected
-    assert fixture[fixture_name] == expected[fixture_name]
+    with open("/tmp/actual.json", "w") as f:
+        f.write(
+            json.dumps(
+                generated_fixture.json_dict_with_info(hash_only=True), indent=4
+            )
+        )
+    assert fixture[fixture_name] == expected[fixture_name], (
+        f"EXPECTED: {json.dumps(expected[fixture_name])}"
+    )

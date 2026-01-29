@@ -22,7 +22,11 @@ from execution_testing.test_types.transaction_types import (
 )
 
 from .base import BaseFixture
-from .common import FixtureAuthorizationTuple, FixtureBlobSchedule
+from .common import (
+    FixtureAuthorizationTuple,
+    FixtureBlobSchedule,
+    FixtureTransactionReceipt,
+)
 
 
 class FixtureEnvironment(EnvironmentGeneric[ZeroPaddedHexNumber]):
@@ -89,6 +93,7 @@ class FixtureForkPost(CamelModel):
 
     state_root: Hash = Field(..., alias="hash")
     logs_hash: Hash = Field(..., alias="logs")
+    receipt: FixtureTransactionReceipt | None = None
     tx_bytes: Bytes = Field(..., alias="txbytes")
     indexes: FixtureForkPostIndexes = Field(
         default_factory=FixtureForkPostIndexes
