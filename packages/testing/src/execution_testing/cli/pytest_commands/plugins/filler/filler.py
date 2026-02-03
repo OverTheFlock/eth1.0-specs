@@ -6,10 +6,12 @@ and that modifies pytest hooks in order to fill test specs for all tests
 and writes the generated fixtures to file.
 """
 
+import atexit
 import configparser
 import datetime
 import json
 import os
+import signal
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +37,8 @@ from execution_testing.client_clis import TransitionTool
 from execution_testing.client_clis.clis.geth import FixtureConsumerTool
 from execution_testing.fixtures import (
     BaseFixture,
+    BlockchainEngineFixture,
+    BlockchainFixture,
     FixtureCollector,
     FixtureConsumer,
     FixtureFillingPhase,
@@ -43,6 +47,7 @@ from execution_testing.fixtures import (
     PreAllocGroupBuilder,
     PreAllocGroupBuilders,
     PreAllocGroups,
+    StateFixture,
     TestInfo,
     merge_partial_fixture_files,
 )
@@ -69,6 +74,47 @@ from ..spec_version_checker.spec_version_checker import (
     get_ref_spec_from_module,
 )
 from .fixture_output import FixtureOutput
+
+# Fixture output dir for keyboard interrupt cleanup (set in pytest_configure).
+# Used by _merge_on_exit to merge partial JSONL files on Ctrl+C or SIGTERM.
+_fixture_output_dir: Path | None = None
+_atexit_registered: bool = False
+_interrupt_count: int = 0
+_original_sigint_handler: Any = None
+_original_sigterm_handler: Any = None
+
+
+def _termination_handler(signum: int, frame: Any) -> None:
+    """Handle SIGINT/SIGTERM gracefully during test filling."""
+    del frame
+    global _interrupt_count
+    global _original_sigint_handler, _original_sigterm_handler
+    _interrupt_count += 1
+
+    if _interrupt_count == 1:
+        # First interrupt: restore original handlers and re-raise
+        if _original_sigint_handler is not None:
+            signal.signal(signal.SIGINT, _original_sigint_handler)
+        if _original_sigterm_handler is not None:
+            signal.signal(signal.SIGTERM, _original_sigterm_handler)
+        if signum == signal.SIGTERM:
+            raise SystemExit(128 + signum)
+        raise KeyboardInterrupt
+    # Subsequent interrupts: ignore and print message
+    print("\nMerging fixtures, please wait...", flush=True)
+
+
+def _merge_on_exit() -> None:
+    """Atexit handler to merge partial JSONL files. Ignores signals."""
+    global _fixture_output_dir
+    if _fixture_output_dir is not None:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        merge_partial_fixture_files(_fixture_output_dir)
+        # Also merge index if partial indexes exist
+        meta_dir = _fixture_output_dir / ".meta"
+        if meta_dir.exists() and any(meta_dir.glob("partial_index*.jsonl")):
+            merge_partial_indexes(_fixture_output_dir, quiet_mode=True)
 
 
 @dataclass(kw_only=True)
@@ -706,6 +752,22 @@ def pytest_configure(config: pytest.Config) -> None:
     except ValueError as e:
         pytest.exit(str(e), returncode=pytest.ExitCode.USAGE_ERROR)
 
+    # Register atexit/signal handlers for cleanup (master only, not workers).
+    global _fixture_output_dir, _atexit_registered
+    global _original_sigint_handler, _original_sigterm_handler
+    is_xdist_worker = hasattr(config, "workerinput")
+    if not config.fixture_output.is_stdout:  # type: ignore[attr-defined]
+        _fixture_output_dir = config.fixture_output.directory  # type: ignore[attr-defined]
+        if not _atexit_registered and not is_xdist_worker:
+            atexit.register(_merge_on_exit)
+            _original_sigint_handler = signal.signal(
+                signal.SIGINT, _termination_handler
+            )
+            _original_sigterm_handler = signal.signal(
+                signal.SIGTERM, _termination_handler
+            )
+            _atexit_registered = True
+
     if (
         not config.getoption("disable_html")
         and config.getoption("htmlpath") is None
@@ -1047,7 +1109,11 @@ def evm_fixture_verification(
         verify_fixtures_bin = evm_bin
         reused_evm_bin = True
     if not verify_fixtures_bin:
-        return
+        pytest.exit(
+            "--verify-fixtures requires --evm-bin or --verify-fixtures-bin "
+            "to be specified.",
+            returncode=pytest.ExitCode.USAGE_ERROR,
+        )
     try:
         evm_fixture_verification = FixtureConsumerTool.from_binary_path(
             binary_path=Path(verify_fixtures_bin),
@@ -1241,13 +1307,16 @@ def fixture_collector(
         generate_index=request.config.getoption("generate_index"),
     )
     yield fixture_collector
-    worker_id = os.environ.get("PYTEST_XDIST_WORKER", None)
-    fixture_collector.dump_fixtures(worker_id)
-    if do_fixture_verification:
-        fixture_collector.verify_fixture_files(evm_fixture_verification)
-    # Write partial index for this worker/scope
-    if fixture_collector.generate_index:
-        fixture_collector.write_partial_index(worker_id)
+    try:
+        # dump_fixtures() only needed for stdout mode
+        fixture_collector.dump_fixtures()
+        # Verify fixtures for stdout mode only (files are in memory).
+        # For file mode, verification happens at session finish after merge.
+        if do_fixture_verification and fixture_output.is_stdout:
+            fixture_collector.verify_fixture_files(evm_fixture_verification)
+    finally:
+        # Always close streaming file handles, even on error
+        fixture_collector.close_streaming_files()
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -1609,6 +1678,65 @@ def pytest_collection_modifyitems(
         items[:] = slow_items + normal_items
 
 
+def _verify_fixtures_post_merge(
+    config: pytest.Config, output_dir: Path
+) -> None:
+    """
+    Verify fixtures after merge if verification is enabled.
+
+    Called from pytest_sessionfinish after partial files are merged into
+    final JSON fixtures. Runs evm statetest/blocktest on each fixture.
+    """
+    if not config.getoption("verify_fixtures"):
+        return
+
+    # Get the verification binary (same logic as evm_fixture_verification)
+    verify_fixtures_bin = config.getoption("verify_fixtures_bin")
+    if not verify_fixtures_bin:
+        verify_fixtures_bin = config.getoption("evm_bin")
+    if not verify_fixtures_bin:
+        return
+
+    try:
+        evm_verification = FixtureConsumerTool.from_binary_path(
+            binary_path=Path(verify_fixtures_bin),
+            trace=getattr(config, "collect_traces", False),
+        )
+    except Exception:
+        # Binary not recognized, skip verification (error already shown
+        # during fixture setup if --verify-fixtures was used)
+        return
+
+    # Map directory names to fixture format classes
+    dir_to_format: dict[str, type[BaseFixture]] = {
+        StateFixture.output_base_dir_name(): StateFixture,
+        BlockchainFixture.output_base_dir_name(): BlockchainFixture,
+        BlockchainEngineFixture.output_base_dir_name(): (
+            BlockchainEngineFixture
+        ),
+    }
+
+    # Find all JSON fixture files and verify them
+    for json_file in output_dir.rglob("*.json"):
+        # Determine fixture format from top-level directory
+        relative_path = json_file.relative_to(output_dir)
+        if not relative_path.parts:
+            continue
+
+        top_dir = relative_path.parts[0]
+        fixture_format = dir_to_format.get(top_dir)
+        if fixture_format is None:
+            continue
+
+        if evm_verification.can_consume(fixture_format):
+            evm_verification.consume_fixture(
+                fixture_format,
+                json_file,
+                fixture_name=None,
+                debug_output_path=None,
+            )
+
+
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """
     Perform session finish tasks.
@@ -1655,6 +1783,9 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     # Remove any lock files that may have been created.
     for file in fixture_output.directory.rglob("*.lock"):
         file.unlink()
+
+    # Verify fixtures after merge if verification is enabled
+    _verify_fixtures_post_merge(session.config, fixture_output.directory)
 
     # Generate index file for all produced fixtures by merging partial indexes.
     # Only merge if partial indexes were actually written (i.e., tests produced
